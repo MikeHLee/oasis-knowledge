@@ -1,0 +1,107 @@
+# =============================================================================
+# Deploy oasis-knowledge to AWS S3 + CloudFront
+# =============================================================================
+# dev branch  -> dev S3 bucket  -> knowledge.dev.cloud.oasis-x.io
+# prod branch -> prod S3 bucket -> knowledge.cloud.oasis-x.io
+# =============================================================================
+
+name: Deploy Knowledge Base
+
+on:
+  push:
+    branches:
+      - dev
+      - prod
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  NODE_VERSION: '20'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_name }}" == "prod" ]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set S3 config
+        id: config
+        run: |
+          ENV="${{ steps.env.outputs.environment }}"
+          if [ "$ENV" == "prod" ]; then
+            echo "s3_bucket=prod-knowledge-075202835966" >> $GITHUB_OUTPUT
+            echo "cf_distribution=" >> $GITHUB_OUTPUT
+          else
+            echo "s3_bucket=dev-knowledge-451873237418" >> $GITHUB_OUTPUT
+            echo "cf_distribution=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Configure AWS credentials (dev)
+        if: steps.env.outputs.environment == 'dev'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_DEV_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_DEV_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure AWS credentials (prod)
+        if: steps.env.outputs.environment == 'prod'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_PROD_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_PROD_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sync to S3
+        run: |
+          BUCKET="${{ steps.config.outputs.s3_bucket }}"
+          aws s3 sync dist/ s3://$BUCKET/ \
+            --delete \
+            --cache-control "max-age=31536000,public" \
+            --exclude "*.html"
+          aws s3 sync dist/ s3://$BUCKET/ \
+            --delete \
+            --cache-control "no-cache,no-store,must-revalidate" \
+            --include "*.html"
+
+      - name: Invalidate CloudFront
+        if: steps.config.outputs.cf_distribution != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.config.outputs.cf_distribution }} \
+            --paths "/*"
