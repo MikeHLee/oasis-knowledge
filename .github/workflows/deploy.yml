@@ -1,11 +1,15 @@
 # =============================================================================
 # Deploy oasis-knowledge to AWS S3 + CloudFront
 # =============================================================================
-# dev branch  -> dev S3 bucket  -> knowledge.dev.cloud.oasis-x.io
-# prod branch -> prod S3 bucket -> knowledge.cloud.oasis-x.io
+# dev branch  -> dev-knowledge-451873237418 S3 -> knowledge.dev.o-x.io
+# prod branch -> prod-knowledge-075202835966 S3 -> knowledge.o-x.io (future)
+#
+# After first terraform apply, copy the knowledge_cloudfront_distribution_id
+# output into the KNOWLEDGE_CF_DISTRIBUTION_DEV repo secret to enable
+# automatic cache invalidation on deploy.
 # =============================================================================
 
-name: Deploy Knowledge Base
+name: Deploy Knowledge Site
 
 on:
   push:
@@ -24,8 +28,8 @@ on:
           - prod
 
 env:
-  NODE_VERSION: '20'
-  AWS_REGION: 'us-east-1'
+  AWS_REGION: us-east-1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   deploy:
@@ -47,29 +51,44 @@ jobs:
             echo "environment=dev" >> $GITHUB_OUTPUT
           fi
 
-      - name: Set S3 config
+      - name: Set S3 + CloudFront config
         id: config
         run: |
           ENV="${{ steps.env.outputs.environment }}"
           if [ "$ENV" == "prod" ]; then
             echo "s3_bucket=prod-knowledge-075202835966" >> $GITHUB_OUTPUT
+            # CF distribution ID intentionally blank until prod TF apply provisions it
             echo "cf_distribution=" >> $GITHUB_OUTPUT
           else
             echo "s3_bucket=dev-knowledge-451873237418" >> $GITHUB_OUTPUT
-            echo "cf_distribution=" >> $GITHUB_OUTPUT
+            # Set KNOWLEDGE_CF_DISTRIBUTION_DEV secret after first terraform apply
+            echo "cf_distribution=${{ secrets.KNOWLEDGE_CF_DISTRIBUTION_DEV }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
+      - name: Validate secrets
+        run: |
+          ENV="${{ steps.env.outputs.environment }}"
+          if [ "$ENV" == "dev" ]; then
+            KEY="${{ secrets.AWS_DEV_ACCESS_KEY_ID }}"
+            if [ -z "$KEY" ]; then
+              echo "::error::AWS_DEV_ACCESS_KEY_ID is empty — set secret in repo settings"
+              exit 1
+            fi
+            if ! echo "$KEY" | grep -qE '^(AKIA|ASIA)[A-Z0-9]{16}$'; then
+              echo "::error::AWS_DEV_ACCESS_KEY_ID looks malformed (expected AKIA/ASIA + 16 chars)"
+              exit 1
+            fi
+          else
+            KEY="${{ secrets.AWS_PROD_ACCESS_KEY_ID }}"
+            if [ -z "$KEY" ]; then
+              echo "::error::AWS_PROD_ACCESS_KEY_ID is empty — set secret in repo settings"
+              exit 1
+            fi
+            if ! echo "$KEY" | grep -qE '^(AKIA|ASIA)[A-Z0-9]{16}$'; then
+              echo "::error::AWS_PROD_ACCESS_KEY_ID looks malformed (expected AKIA/ASIA + 16 chars)"
+              exit 1
+            fi
+          fi
 
       - name: Configure AWS credentials (dev)
         if: steps.env.outputs.environment == 'dev'
@@ -87,17 +106,33 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_PROD_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Sync to S3
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Sync assets to S3 (long cache)
         run: |
           BUCKET="${{ steps.config.outputs.s3_bucket }}"
           aws s3 sync dist/ s3://$BUCKET/ \
             --delete \
-            --cache-control "max-age=31536000,public" \
+            --cache-control "max-age=31536000,public,immutable" \
             --exclude "*.html"
+
+      - name: Sync HTML to S3 (short cache)
+        run: |
+          BUCKET="${{ steps.config.outputs.s3_bucket }}"
           aws s3 sync dist/ s3://$BUCKET/ \
-            --delete \
-            --cache-control "no-cache,no-store,must-revalidate" \
-            --include "*.html"
+            --cache-control "max-age=300,public" \
+            --include "*.html" \
+            --exclude "*"
 
       - name: Invalidate CloudFront
         if: steps.config.outputs.cf_distribution != ''
@@ -105,3 +140,18 @@ jobs:
           aws cloudfront create-invalidation \
             --distribution-id ${{ steps.config.outputs.cf_distribution }} \
             --paths "/*"
+
+      - name: Summary
+        run: |
+          ENV="${{ steps.env.outputs.environment }}"
+          echo "## Knowledge Site Deployed 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** $ENV" >> $GITHUB_STEP_SUMMARY
+          if [ "$ENV" == "prod" ]; then
+            echo "**URL:** https://knowledge.o-x.io" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**URL:** https://knowledge.dev.o-x.io" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -z "${{ steps.config.outputs.cf_distribution }}" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **CloudFront distribution ID not set** — set \`KNOWLEDGE_CF_DISTRIBUTION_DEV\` secret to enable cache invalidation" >> $GITHUB_STEP_SUMMARY
+          fi
